@@ -1,13 +1,18 @@
 import fs from "node:fs";
+import http from "node:http";
+import https from "node:https";
 import path from "node:path";
-import XLSX from "xlsx";
+import readXlsxFile from "read-excel-file/node";
 
 const ROOT = process.cwd();
 const RAW_DIR = path.join(ROOT, "data", "raw");
 const OUT_DIR = path.join(ROOT, "public", "data");
 const PACKAGE_PATH = path.join(ROOT, "data", "package.json");
+const OUT_FILE = path.join(OUT_DIR, "dashboard-data.json");
 const SOURCE_URL = "https://data.gov.ro/dataset/servicii-consulare";
 const CKAN_API_URL = "https://data.gov.ro/api/3/action/package_show?id=servicii-consulare";
+const REQUEST_TIMEOUT_MS = Number(process.env.DATA_GOV_TIMEOUT_MS || 60000);
+const MAX_ATTEMPTS = Number(process.env.DATA_GOV_ATTEMPTS || 4);
 
 const monthNumbers = new Map([
   ["ianuarie", 1],
@@ -56,16 +61,77 @@ function safeFileName(resource) {
 }
 
 async function fetchJson(url) {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status}`);
-  return response.json();
+  const buffer = await requestWithRetries(url, "metadata CKAN");
+  return JSON.parse(buffer.toString("utf8").replace(/^\uFEFF/, ""));
 }
 
 async function downloadFile(url, outputPath) {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`Failed to download ${url}: ${response.status}`);
-  const buffer = Buffer.from(await response.arrayBuffer());
+  const buffer = await requestWithRetries(url, path.basename(outputPath));
   fs.writeFileSync(outputPath, buffer);
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function requestBuffer(url, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const client = parsed.protocol === "http:" ? http : https;
+    const request = client.get(
+      parsed,
+      {
+        headers: {
+          "User-Agent": "dashboard-servicii-consulare/1.0 (+https://data.gov.ro/dataset/servicii-consulare)",
+          Accept: "*/*",
+        },
+        timeout: REQUEST_TIMEOUT_MS,
+      },
+      (response) => {
+        const status = response.statusCode || 0;
+        if ([301, 302, 303, 307, 308].includes(status) && response.headers.location) {
+          response.resume();
+          if (redirects > 5) {
+            reject(new Error(`Too many redirects for ${url}`));
+            return;
+          }
+          const nextUrl = new URL(response.headers.location, parsed).toString();
+          requestBuffer(nextUrl, redirects + 1).then(resolve, reject);
+          return;
+        }
+
+        if (status < 200 || status >= 300) {
+          response.resume();
+          reject(new Error(`HTTP ${status} for ${url}`));
+          return;
+        }
+
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => resolve(Buffer.concat(chunks)));
+      },
+    );
+
+    request.on("timeout", () => {
+      request.destroy(new Error(`Timeout after ${REQUEST_TIMEOUT_MS}ms for ${url}`));
+    });
+    request.on("error", reject);
+  });
+}
+
+async function requestWithRetries(url, label) {
+  let lastError;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    try {
+      if (attempt > 1) console.log(`Retry ${attempt}/${MAX_ATTEMPTS}: ${label}`);
+      return await requestBuffer(url);
+    } catch (error) {
+      lastError = error;
+      console.warn(`Attempt ${attempt}/${MAX_ATTEMPTS} failed for ${label}: ${error.message}`);
+      if (attempt < MAX_ATTEMPTS) await wait(1500 * attempt);
+    }
+  }
+  throw lastError;
 }
 
 async function loadPackage() {
@@ -203,15 +269,32 @@ function periodFor(year, quarter, monthName) {
   };
 }
 
-function nonEmptySheets(workbook) {
-  return workbook.SheetNames.map((sheetName) => {
-    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], {
-      defval: "",
-      raw: false,
-      blankrows: false,
+function cellToValue(value) {
+  if (value === null || value === undefined) return "";
+  if (value instanceof Date) return value.toISOString();
+  return value;
+}
+
+async function nonEmptySheets(filePath) {
+  const sheets = [];
+  const workbookSheets = await readXlsxFile(filePath);
+  for (const workbookSheet of workbookSheets) {
+    const sheetName = workbookSheet.sheet;
+    const matrix = workbookSheet.data;
+    const nonEmptyRows = matrix.filter((row) => row.some((cell) => cleanString(cell).length > 0));
+    if (nonEmptyRows.length < 2) continue;
+
+    const headers = nonEmptyRows[0].map((cell) => cleanString(cell));
+    const rows = nonEmptyRows.slice(1).map((row) => {
+      const record = {};
+      headers.forEach((header, index) => {
+        if (header) record[header] = cellToValue(row[index]);
+      });
+      return record;
     });
-    return { sheetName, rows };
-  }).filter((sheet) => sheet.rows.length > 0);
+    sheets.push({ sheetName, rows });
+  }
+  return sheets;
 }
 
 function makeNormalizedRow({
@@ -428,8 +511,7 @@ async function main() {
 
   for (const resource of resources) {
     const filePath = path.join(RAW_DIR, resource.fileName);
-    const workbook = XLSX.readFile(filePath, { cellDates: false, raw: false });
-    for (const { sheetName, rows } of nonEmptySheets(workbook)) {
+    for (const { sheetName, rows } of await nonEmptySheets(filePath)) {
       const columns = [...new Set(rows.flatMap((row) => Object.keys(row).filter(Boolean)))];
       rawTables.push({
         sourceId: resource.id,
@@ -500,12 +582,17 @@ async function main() {
     validationTotals,
   };
 
-  fs.writeFileSync(path.join(OUT_DIR, "dashboard-data.json"), JSON.stringify(data));
+  fs.writeFileSync(OUT_FILE, JSON.stringify(data));
   console.log(`Wrote ${normalizedRows.length} normalized rows from ${resources.length} resources.`);
   console.log(`Raw tables: ${rawTables.length}; validation totals: ${validationTotals.length}.`);
 }
 
 main().catch((error) => {
+  if (fs.existsSync(OUT_FILE)) {
+    console.warn(`Ingest failed, using cached ${path.relative(ROOT, OUT_FILE)}.`);
+    console.warn(error);
+    return;
+  }
   console.error(error);
   process.exit(1);
 });

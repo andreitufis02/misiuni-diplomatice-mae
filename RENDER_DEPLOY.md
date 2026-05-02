@@ -1,9 +1,11 @@
 # Deploy pe Render
 
 Dashboardul este o aplicație Vite/React statică. La build, scriptul `npm run ingest`
-descarcă automat metadatele CKAN și cele 36 de fișiere XLSX de pe data.gov.ro,
-normalizează datele și generează `public/data/dashboard-data.json`. Fișierele brute
-și datele generate sunt ignorate în git, ca repo-ul să rămână mic.
+încearcă să descarce automat metadatele CKAN și cele 36 de fișiere XLSX de pe
+data.gov.ro, normalizează datele și generează `public/data/dashboard-data.json`.
+Fișierele brute sunt ignorate în git, dar `public/data/dashboard-data.json` trebuie
+urcat în repo ca fallback. Așa deploy-ul nu pică dacă data.gov.ro răspunde lent în
+timpul build-ului Render.
 
 ## Ce urci pe GitHub
 
@@ -15,6 +17,7 @@ Urcă doar codul sursă:
 - `vite.config.js`
 - `scripts/`
 - `src/`
+- `public/data/dashboard-data.json`
 - `.gitignore`
 - `RENDER_DEPLOY.md`
 
@@ -24,7 +27,6 @@ Nu urca:
 - `dist/`
 - `data/raw/`
 - `data/package.json`
-- `public/data/`
 - `src/data/`
 - fișiere `.log`
 
@@ -43,8 +45,8 @@ Publish Directory: dist
 
 6. Click `Create Static Site`.
 
-Render va rula build-ul, va genera datele din sursa publică și va publica folderul
-`dist` la o adresă de forma:
+Render va rula build-ul, va încerca să actualizeze datele din sursa publică și va
+publica folderul `dist` la o adresă de forma:
 
 ```text
 https://numele-proiectului.onrender.com/
@@ -59,4 +61,5 @@ npm run preview
 ```
 
 `npm run build` trebuie să termine fără erori. Dacă data.gov.ro nu răspunde în
-momentul build-ului, rulează din nou comanda după câteva minute.
+momentul build-ului, scriptul folosește automat copia cache din
+`public/data/dashboard-data.json`.
