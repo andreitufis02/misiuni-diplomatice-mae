@@ -606,7 +606,7 @@ function Footer({ dataset }) {
       <div className="footer-brand">
         <img src={shapingLogo} alt="Shaping logo" />
         <p>
-          „Această platformă este dezvoltată de Andrei-Mihai Tufiș, student masterand FSGC, programul de Politici Publice și Advocacy.”
+          Această platformă este dezvoltată de Andrei-Mihai Tufiș, student masterand FSGC, programul de Politici Publice și Advocacy.
         </p>
       </div>
       <div className="footer-grid">
